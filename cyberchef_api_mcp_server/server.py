@@ -28,6 +28,48 @@ class CyberChefRecipeOperation(BaseModel):
     args: Optional[list] = None
 
 
+def convert_recipe_to_api_format(recipe: list[CyberChefRecipeOperation]) -> list:
+    """
+    Convert CyberChefRecipeOperation objects to the format expected by the CyberChef API
+    
+    The API supports multiple formats:
+    - Simple operation name as string: "To Hex"
+    - Operation with args object: {"op": "To Hex", "args": {"delimiter": "Colon"}}
+    - Operation with args array: {"op": "To Morse Code", "args": ["Dash/Dot", "Backslash", "Comma"]}
+    - Array of operation names: ["to decimal", "MD5", "to braille"]
+    
+    :param recipe: list of CyberChefRecipeOperation objects
+    :return: recipe in API format
+    """
+    if not recipe:
+        return []
+    
+    # If all operations have no args, return simple operation names
+    if all(not op.args or len(op.args) == 0 for op in recipe):
+        return [op.op for op in recipe]
+    
+    # Convert to API format with proper args handling
+    api_recipe = []
+    for op in recipe:
+        op_dict = {"op": op.op}
+        
+        # Only include args if they exist and are not empty
+        if op.args and len(op.args) > 0:
+            # Check if args look like they should be positional (simple values)
+            # or named (dicts or complex objects)
+            if len(op.args) == 1 and not isinstance(op.args[0], (dict, list)):
+                # Single simple argument, could be positional or named
+                # We'll try positional first (array format)
+                op_dict["args"] = op.args
+            else:
+                # Multiple arguments or complex argument - use as positional array
+                op_dict["args"] = op.args
+        
+        api_recipe.append(op_dict)
+    
+    return api_recipe
+
+
 def create_api_request(endpoint: str, request_data: dict) -> dict:
     """
     Send a POST request to one of the CyberChef API endpoints to process request data and retrieve the response
@@ -44,13 +86,22 @@ def create_api_request(endpoint: str, request_data: dict) -> dict:
 
     try:
         log.info(f"Attempting to send POST request to {api_url}")
+        log.info(f"Request data: {request_data}")
         response = httpx.post(
             url=api_url,
             headers=request_headers,
-            json=request_data
+            json=request_data,
+            timeout=30.0
         )
         response.raise_for_status()
         return response.json()
+    except httpx.HTTPStatusError as http_exc:
+        log.error(f"HTTP error {http_exc.response.status_code} during POST request to {api_url} - {http_exc}")
+        try:
+            error_data = http_exc.response.json()
+            return {"error": f"HTTP {http_exc.response.status_code}: {error_data.get('message', str(http_exc))}"}
+        except:
+            return {"error": f"HTTP {http_exc.response.status_code}: {str(http_exc)}"}
     except httpx.RequestError as req_exc:
         log.error(f"Exception raised during HTTP POST request to {api_url} - {req_exc}")
         return {"error": f"Exception raised during HTTP POST request to {api_url} - {req_exc}"}
@@ -84,21 +135,27 @@ def bake_recipe(input_data: str, recipe: list[CyberChefRecipeOperation]) -> dict
     :param recipe: a pydantic model of operations to 'bake'/execute on the input data
     :return:
     """
+    # Convert recipe to API format
+    api_recipe = convert_recipe_to_api_format(recipe)
+    
     request_data = {
         "input": input_data,
-        "recipe": [op.model_dump() for op in recipe]
+        "recipe": api_recipe
     }
+    log.info(f"Sending bake request with recipe: {api_recipe}")
     response_data = create_api_request(endpoint="bake", request_data=request_data)
 
     # If the response has a byte array, decode and return
     data_type = response_data.get("type")
     if data_type is not None and data_type == "byteArray":
-        decoded_value = bytes(response_data["value"]).decode()
-        response_data["value"] = decoded_value
-        response_data["type"] = "string"
-        return response_data
-    else:
-        return response_data
+        try:
+            decoded_value = bytes(response_data["value"]).decode()
+            response_data["value"] = decoded_value
+            response_data["type"] = "string"
+        except (ValueError, TypeError) as e:
+            log.warning(f"Could not decode byte array: {e}")
+            
+    return response_data
 
 
 @mcp.tool()
@@ -110,19 +167,27 @@ def batch_bake_recipe(batch_input_data: list[str], recipe: list[CyberChefRecipeO
     :param recipe: a list of operations to 'bake'/execute on the input data
     :return:
     """
+    # Convert recipe to API format
+    api_recipe = convert_recipe_to_api_format(recipe)
+    
     request_data = {
         "input": batch_input_data,
-        "recipe": [op.model_dump() for op in recipe]
+        "recipe": api_recipe
     }
+    log.info(f"Sending batch bake request with recipe: {api_recipe}")
     response_data = create_api_request(endpoint="batch/bake", request_data=request_data)
 
     # If any of the responses have a byte array, decode and return
-    for response in response_data:
-        data_type = response.get("type")
-        if data_type is not None and data_type == "byteArray":
-            decoded_value = bytes(response["value"]).decode()
-            response["value"] = decoded_value
-            response["type"] = "string"
+    if isinstance(response_data, list):
+        for response in response_data:
+            data_type = response.get("type")
+            if data_type is not None and data_type == "byteArray":
+                try:
+                    decoded_value = bytes(response["value"]).decode()
+                    response["value"] = decoded_value
+                    response["type"] = "string"
+                except (ValueError, TypeError) as e:
+                    log.warning(f"Could not decode byte array: {e}")
 
     return response_data
 
